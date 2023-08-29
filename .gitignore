@@ -1,4 +1,7 @@
-target
+target/
+target-trunk/
+/dist/
+/.log/
 dist
 pkg
 comparisons
