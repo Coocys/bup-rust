@@ -1,95 +1,66 @@
-use axum::body::{boxed, Body};
-use axum::http::{Response, StatusCode};
-use axum::{response::IntoResponse, routing::get, Router};
-use clap::Parser;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
-use std::str::FromStr;
-use tokio::fs;
-use tower::{ServiceBuilder, ServiceExt};
-use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
+#![allow(unused)] // For early development.
 
-// Setup the command line interface with clap.
-#[derive(Parser, Debug)]
-#[clap(name = "server", about = "A server for our wasm project!")]
-struct Opt {
-    /// set the log level
-    #[clap(short = 'l', long = "log", default_value = "debug")]
-    log_level: String,
+// region:    --- Modules
 
-    /// set the listen addr
-    #[clap(short = 'a', long = "addr", default_value = "::1")]
-    addr: String,
+mod config;
+mod ctx;
+mod error;
+mod log;
+mod model;
+mod web;
 
-    /// set the listen port
-    #[clap(short = 'p', long = "port", default_value = "8080")]
-    port: u16,
+// #[cfg(test)] // Commented during early development.
+pub mod _dev_utils;
 
-    /// set the directory where static files are to be found
-    #[clap(long = "static-dir", default_value = "./dist")]
-    static_dir: String,
-}
+pub use self::error::{Error, Result};
+pub use config::config;
+
+use crate::model::ModelManager;
+use crate::web::mw_auth::mw_ctx_resolve;
+use crate::web::mw_res_map::mw_reponse_map;
+use crate::web::{routes_login, routes_static};
+use axum::{middleware, Router};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+use std::net::SocketAddr;
+use tower_cookies::CookieManagerLayer;
+
+// endregion: --- Modules
 
 #[tokio::main]
-async fn main() {
-    let opt = Opt::parse();
+async fn main() -> Result<()> {
+	tracing_subscriber::fmt()
+		.without_time() // For early local development.
+		.with_target(false)
+		.with_env_filter(EnvFilter::from_default_env())
+		.init();
 
-    // Setup logging & RUST_LOG from args
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", format!("{},hyper=info,mio=info", opt.log_level))
-    }
-    // enable console logging
-    tracing_subscriber::fmt::init();
+	// -- FOR DEV ONLY
+	_dev_utils::init_dev().await;
 
-    let app = Router::new()
-        .route("/api/hello", get(hello))
-        .fallback_service(get(|req| async move {
-            match ServeDir::new(&opt.static_dir).oneshot(req).await {
-                Ok(res) => {
-                    let status = res.status();
-                    match status {
-                        StatusCode::NOT_FOUND => {
-                            let index_path = PathBuf::from(&opt.static_dir).join("index.html");
-                            let index_content = match fs::read_to_string(index_path).await {
-                                Err(_) => {
-                                    return Response::builder()
-                                        .status(StatusCode::NOT_FOUND)
-                                        .body(boxed(Body::from("index file not found")))
-                                        .unwrap()
-                                }
-                                Ok(index_content) => index_content,
-                            };
-    
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(boxed(Body::from(index_content)))
-                                .unwrap()
-                        }
-                        _ => res.map(boxed),
-                    }
-                }
-                Err(err) => Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(boxed(Body::from(format!("error: {err}"))))
-                    .expect("error response"),
-            }
-        }))
-        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
+	// Initialize ModelManager.
+	let mm = ModelManager::new().await?;
 
-    let sock_addr = SocketAddr::from((
-        IpAddr::from_str(opt.addr.as_str()).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-        opt.port,
-    ));
+	// -- Define Routes
+	// let routes_rpc = rpc::routes(mm.clone())
+	//   .route_layer(middleware::from_fn(mw_ctx_require));
 
-    log::info!("listening on http://{}", sock_addr);
+	let routes_all = Router::new()
+		.merge(routes_login::routes())
+		// .nest("/api", routes_rpc)
+		.layer(middleware::map_response(mw_reponse_map))
+		.layer(middleware::from_fn_with_state(mm.clone(), mw_ctx_resolve))
+		.layer(CookieManagerLayer::new())
+		.fallback_service(routes_static::serve_dir());
 
-    axum::Server::bind(&sock_addr)
-        .serve(app.into_make_service())
-        .await
-        .expect("Unable to start server");
-}
+	// region:    --- Start Server
+	let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+	info!("{:<12} - {addr}\n", "LISTENING");
+	axum::Server::bind(&addr)
+		.serve(routes_all.into_make_service())
+		.await
+		.unwrap();
+	// endregion: --- Start Server
 
-async fn hello() -> impl IntoResponse {
-    "hello from server!"
+	Ok(())
 }
